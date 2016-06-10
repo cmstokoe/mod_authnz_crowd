@@ -33,6 +33,7 @@
 
 cache_t *auth_cache;
 cache_t *groups_cache;
+cache_t *attributes_cache;
 cache_t *cookie_config_cache;
 cache_t *session_cache;
 
@@ -58,6 +59,7 @@ xmlChar *session_xml_name = NULL;
 xmlChar *cookie_config_xml_name = NULL;
 xmlChar *secure_xml_name = NULL;
 xmlChar *domain_xml_name = NULL;
+xmlChar *firstname_xml_name = NULL;
 
 /**
  * Must be called before the first use of the Crowd Client.
@@ -72,6 +74,7 @@ void crowd_init() {
     cookie_config_xml_name = xml_string("cookie-config");
     secure_xml_name = xml_string("secure");
     domain_xml_name = xml_string("domain");
+    firstname_xml_name = xml_string("first-name");
     if (curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
         fprintf(stderr, PACKAGE_STRING " failed to initialise libcurl.");
         exit(1);
@@ -121,6 +124,11 @@ typedef struct {
     int count;
     char **groups;
 } cached_groups_t;
+
+typedef struct {
+    int count;
+    char **attributes;
+} cached_attributes_t;
 
 static void *copy_groups(void *data, apr_pool_t *p){
     cached_groups_t *original = data;
@@ -189,6 +197,10 @@ bool crowd_cache_create(apr_pool_t *pool, apr_time_t max_age, unsigned int max_e
     }
     groups_cache = cache_create("groups", pool, max_age, max_entries, copy_groups, free_groups);
     if (groups_cache == NULL) {
+        return false;
+    }
+    attributes_cache = cache_create("attributes", pool, max_age, max_entries, copy_groups, free_groups);
+    if (attributes_cache == NULL) {
         return false;
     }
     cookie_config_cache = cache_create("cookie config", pool, max_age, max_entries, copy_cookie_config, free_cookie_config);
@@ -987,6 +999,119 @@ crowd_authenticate_result crowd_validate_session(const request_rec *r, const cro
     }
 }
 
+/*================================
+ * Crowd user attributes retrieval
+ *================================*/
+
+typedef struct {
+    const char *user;
+    apr_array_header_t *attributes;
+} user_attributes;
+
+static const char *make_user_attributes_url(const request_rec *r, const crowd_config *config, CURL *curl_easy,
+    const void *extra) {
+    const user_attributes *data = (const user_attributes *)extra;
+    return make_url(r, config, curl_easy, data->user, "%srest/usermanagement/1/user?username=%s");
+}
+
+static bool handle_crowd_user_element(write_data_t *write_data, const xmlChar *text) {
+    if (expect_xml_element(write_data, user_xml_name, text)) {
+        int ret = xmlTextReaderRead(write_data->xml_reader);
+        while (ret == 1) {
+    		xmlChar *name = xmlTextReaderConstName(write_data->xml_reader);
+    		if (name == NULL)
+			name = BAD_CAST "--";
+		xmlChar *value = xmlTextReaderConstValue(write_data->xml_reader);
+		if (xmlTextReaderNodeType(write_data->xml_reader) == 3) {
+			value = log_ralloc(write_data->r, apr_pstrdup(write_data->r->pool, (char const*)value));
+    			APR_ARRAY_PUSH(((user_attributes *) write_data->extra)->attributes, const char *) = (char const*)value;
+		}
+            	ret = xmlTextReaderRead(write_data->xml_reader);
+        }
+    }
+    write_data->body_valid = true;
+    return true;
+}
+
+/**
+ * Obtain a list of attributes associated with a given user.
+ *
+ * @param username  The name of the user.
+ * @param r         The current Apache httpd request.
+ * @param config    The configuration details of the Crowd Client.
+ * @returns An APR array of (char *) user attributes, or NULL upon failure.
+ */
+
+apr_array_header_t *crowd_user_attributes(const char *username, const request_rec *r, const crowd_config *config) {
+    apr_array_header_t *attributes;
+
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Attributes requested for '%s'", username);
+
+    /* Check cache */
+    char *cache_key = NULL;
+    if (attributes_cache != NULL) {
+        cache_key = make_user_cache_key(username, r, config);
+        if (cache_key != NULL) {
+            cached_attributes_t *cached_attributes = cache_get(attributes_cache, cache_key, r);
+            if (cached_attributes != NULL) {
+                attributes = log_ralloc(r, apr_array_make(r->pool, cached_attributes->count, sizeof(char *)));
+                if (attributes == NULL) {
+                    return NULL;
+                }
+                int i;
+                for (i = 0; i < cached_attributes->count; i++) {
+                    APR_ARRAY_PUSH(attributes, const char *) = apr_pstrdup(r->pool, cached_attributes->attributes[i]);
+                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Cached attributes for '%s': %s", username, cached_attributes->attributes[i]);
+                }
+                return attributes;
+            }
+        }
+    }
+
+    attributes = log_ralloc(r, apr_array_make(r->pool, 0, sizeof(char *)));
+    if (attributes == NULL) {
+        return NULL;
+    }
+
+    user_attributes data = {username, attributes};
+    xml_node_handler_t *xml_node_handlers = make_xml_node_handlers(r);
+    if (xml_node_handlers == NULL) {
+        return NULL;
+    }
+    xml_node_handlers[XML_READER_TYPE_ELEMENT] = handle_crowd_user_element;
+    if (crowd_request(r, config, false, make_user_attributes_url, NULL, xml_node_handlers, &data) != HTTP_OK) {
+        return NULL;
+    }
+
+    /* Cache result */
+    if (cache_key != NULL) {
+        cached_attributes_t *cached_attributes = log_ralloc(r, malloc(sizeof(cached_attributes_t)));
+        if (cached_attributes != NULL) {
+            cached_attributes->attributes = log_ralloc(r, malloc(attributes->nelts * sizeof(char *)));
+            if (cached_attributes->attributes == NULL) {
+                free(cached_attributes);
+            } else {
+                int i;
+                for (i = 0; i < attributes->nelts; i++) {
+                    cached_attributes->attributes[i] = log_ralloc(r, strdup(APR_ARRAY_IDX(attributes, i, char *)));
+                    if (cached_attributes->attributes[i] == NULL) {
+                        for (i--; i >= 0; i--) {
+                            free(cached_attributes->attributes[i]);
+                        }
+                        free(cached_attributes->attributes);
+                        free(cached_attributes);
+                        return attributes;
+                    }
+                }
+                cached_attributes->count = attributes->nelts;
+                cache_put(attributes_cache, cache_key, cached_attributes, r);
+            }
+        }
+    }
+
+    return attributes;
+}
+
 /*============================
  * Crowd user group retrieval
  *============================*/
@@ -1063,7 +1188,6 @@ apr_array_header_t *crowd_user_groups(const char *username, const request_rec *r
     apr_array_header_t *user_groups;
 
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Memberships requested for '%s'", username);
-
     /* Check cache */
     char *cache_key = NULL;
     if (groups_cache != NULL) {

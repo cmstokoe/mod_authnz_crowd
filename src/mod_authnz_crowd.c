@@ -256,6 +256,12 @@ static const char *set_crowd_ssl_verify_peer(cmd_parms *parms, void *mconfig, in
     return set_flag_once(parms, &(config->crowd_config->crowd_ssl_verify_peer), &(config->ssl_verify_peer_set), on);
 }
 
+static const char *set_crowd_attributes_env_name(cmd_parms *parms, void *mconfig, const char *w)
+{
+    authnz_crowd_dir_config *config = (authnz_crowd_dir_config *) mconfig;
+    return set_once(parms, &(config->crowd_config->attributes_env_name), w);
+}
+
 static const char *set_crowd_groups_env_name(cmd_parms *parms, void *mconfig, const char *w)
 {
     authnz_crowd_dir_config *config = (authnz_crowd_dir_config *) mconfig;
@@ -293,8 +299,10 @@ static const command_rec commands[] =
         "'On' if single-sign on cookies should be created as HttpOnly; 'Off' otherwise (default = Off)"),
     AP_INIT_FLAG("CrowdSSLVerifyPeer", set_crowd_ssl_verify_peer, NULL, OR_AUTHCFG,
             "'On' if SSL certificate validation should occur when connecting to Crowd; 'Off' otherwise (default = On)"),
+    AP_INIT_TAKE1("CrowdAttributesEnvName", set_crowd_attributes_env_name, NULL, OR_AUTHCFG,
+        "Name of the environment variable in which to store a delimited list of the remote users attributes"),
     AP_INIT_TAKE1("CrowdGroupsEnvName", set_crowd_groups_env_name, NULL, OR_AUTHCFG,
-        "Name of the environment variable in which to store a space-delimited list of groups that the remote user belongs to"),
+        "Name of the environment variable in which to store a delimited list of groups that the remote user belongs to"),
     {0}
 };
 
@@ -365,8 +373,64 @@ static int check_for_cookie(void *rec, const char *key, const char *value) {
     return 1;
 }
 
+#define USR_ENV_MAX_ATTR 128
+#define USR_ENV_DELIMITER "|"
+#define USR_ENV_DELIMITER_LEN (sizeof(USR_ENV_DELIMITER) - sizeof(char))
+static void crowd_set_attributes_env_variable(request_rec *r) {
+    authnz_crowd_dir_config *config = get_config(r);
+    const char *attribute_env_name = config->crowd_config->attributes_env_name;
+    if (attribute_env_name == NULL) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "CrowdAttributesEnvName undefined; returning.");
+        return;
+    }
+
+    apr_array_header_t *user_attributes = authnz_crowd_user_attributes(r->user, r);
+    if (user_attributes == NULL) {
+        ap_log_rerror(APLOG_MARK, APLOG_NOTICE, 0, r, "While setting attributes environment variable '%s' for remote user '%s': authnz_crowd_user_groups() returned NULL.", attribute_env_name, r->user);
+        return;
+    }
+
+    apr_size_t nattr = user_attributes->nelts;
+    if (nattr <= 0) {
+        apr_table_set(r->subprocess_env, attribute_env_name, "");
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Set attributes environment variable '%s' for remote user '%s' to empty.", attribute_env_name, r->user);
+        return;
+    }
+
+    if (nattr > USR_ENV_MAX_ATTR) {
+        ap_log_rerror(APLOG_MARK, APLOG_NOTICE, 0, r, "While setting attributes environment variable '%s' for remote user '%s': Value will be clipped as number of attributes (%d) exceeds USR_ENV_MAX_ATTR (%d).", attribute_env_name, r->user, nattr, USR_ENV_MAX_ATTR);
+        nattr = USR_ENV_MAX_ATTR;
+    }
+
+    apr_size_t nvec = nattr + (nattr - 1); /* Attributes + conjunctive delimiters */
+    struct iovec *iov = apr_pcalloc(r->pool, sizeof(struct iovec) * nvec);
+    int i, k;
+    for (i = 0, k = 0; i < nattr; i++) {
+        if (i >= 1) {
+            /* Join previous entry with a delimiter */
+            iov[k].iov_base = USR_ENV_DELIMITER;
+            iov[k].iov_len = USR_ENV_DELIMITER_LEN;
+            k++;
+        }
+
+        void *attr = APR_ARRAY_IDX(user_attributes, i, void *);
+        iov[k].iov_base = attr;
+        iov[k].iov_len = strlen(attr);
+        k++;
+    }
+
+    const char *attributes = apr_pstrcatv(r->pool, iov, nvec, NULL);
+    if (attributes == NULL) {
+        ap_log_rerror(APLOG_MARK, APLOG_NOTICE, 0, r, "While setting attributes variable '%s' for remote user '%s': apr_pstrcatv() returned NULL.", attribute_env_name, r->user);
+        return;
+    }
+
+    apr_table_set(r->subprocess_env, attribute_env_name, attributes);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Set attributes environment variable '%s' for remote user '%s' to '%s'", attribute_env_name, r->user, attributes);
+}
+
 #define GRP_ENV_MAX_GROUPS 128
-#define GRP_ENV_DELIMITER " "
+#define GRP_ENV_DELIMITER "|"
 #define GRP_ENV_DELIMITER_LEN (sizeof(GRP_ENV_DELIMITER) - sizeof(char))
 static void crowd_set_groups_env_variable(request_rec *r) {
     authnz_crowd_dir_config *config = get_config(r);
@@ -435,6 +499,7 @@ static int check_user_id(request_rec *r) {
     if (crowd_validate_session(r, config->crowd_config, data.token, &r->user) == CROWD_AUTHENTICATE_SUCCESS) {
         r->ap_auth_type = "Crowd SSO";
         crowd_set_groups_env_variable(r);
+	crowd_set_attributes_env_variable(r);
         return OK;
     }
     return DECLINED;
@@ -504,6 +569,7 @@ static authn_status authn_crowd_check_password(request_rec *r, const char *user,
                 case CROWD_AUTHENTICATE_SUCCESS:
                     ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, "Authenticated '%s'.", xlated_user);
                     crowd_set_groups_env_variable(r);
+		    crowd_set_attributes_env_variable(r);
                     return AUTH_GRANTED;
                 case CROWD_AUTHENTICATE_FAILURE:
                     break;
@@ -589,6 +655,15 @@ static int post_config(apr_pool_t *pconf, apr_pool_t *plog __attribute__((unused
         }
     }
     return OK;
+}
+
+apr_array_header_t *authnz_crowd_user_attributes(const char *username, request_rec *r) {
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "authnz_crowd_user_attributes");
+    authnz_crowd_dir_config *config = get_config(r);
+    if (config == NULL) {
+        return NULL;
+    }
+    return crowd_user_attributes(username, r, config->crowd_config);
 }
 
 apr_array_header_t *authnz_crowd_user_groups(const char *username, request_rec *r) {

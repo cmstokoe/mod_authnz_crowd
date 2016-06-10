@@ -18,6 +18,7 @@ typedef struct {
     bool crowd_ssl_verify_peer;         /* Flag to control whether or not SSL certificates are validated */
     long crowd_timeout;                 /* Crowd response timeout, in seconds, or 0 for no timeout */
     const char *groups_env_name;        /* Name of the environment variable in which to store a space-delimited list of groups that the remote user belongs to */
+    const char *attributes_env_name;    /* Name of the environment variable in which to store a space-delimited list og attributes belonging to the remote user */
 } crowd_config;
 
 /**
@@ -83,6 +84,16 @@ crowd_authenticate_result crowd_create_session(const request_rec *r, const crowd
  */
 crowd_authenticate_result crowd_validate_session(const request_rec *r, const crowd_config *config, char *token,
     char **user);
+
+/**
+ * Obtain a list of attributes associated with a given user.
+ * @param username  The name of the user.
+ * @param r         The current Apache httpd request.
+ * @param config    The configuration details of the Crowd Client.
+ * @returns An APR array of (char *) user attributes, or NULL upon failure.
+ */
+
+apr_array_header_t *crowd_user_attributes(const char *username, const request_rec *r, const crowd_config *config); 
 
 /**
  * Obtain the list of Crowd groups to which the current user belongs.
